@@ -5,6 +5,7 @@
 #include <getopt.h>
 #include <libinput.h>
 #include <linux/input-event-codes.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,6 +49,7 @@
 #include <wlr/types/wlr_xdg_shell.h>
 #include <wlr/util/log.h>
 #include <xkbcommon/xkbcommon.h>
+#include <czmq.h>
 #ifdef XWAYLAND
 #include <X11/Xlib.h>
 #include <wlr/xwayland.h>
@@ -80,6 +82,11 @@ typedef union {
 	float f;
 	const void *v;
 } Arg;
+
+typedef struct {
+    short id;
+    void (*func)(zmsg_t *);
+} MsgHandler;
 
 typedef struct {
 	unsigned int mod;
@@ -212,6 +219,7 @@ static void arrange(Monitor *m);
 static void arrangelayer(Monitor *m, struct wl_list *list,
 		struct wlr_box *usable_area, int exclusive);
 static void arrangelayers(Monitor *m);
+static void autostartexec(void);
 static void axisnotify(struct wl_listener *listener, void *data);
 static void buttonpress(struct wl_listener *listener, void *data);
 static void chvt(const Arg *arg);
@@ -238,6 +246,7 @@ static void focusmon(const Arg *arg);
 static void focusstack(const Arg *arg);
 static Client *focustop(Monitor *m);
 static void fullscreennotify(struct wl_listener *listener, void *data);
+static int handleincoming(zloop_t *loop, zsock_t *reader, void *arg);
 static void incnmaster(const Arg *arg);
 static void inputdevice(struct wl_listener *listener, void *data);
 static int keybinding(uint32_t mods, xkb_keysym_t sym);
@@ -275,6 +284,7 @@ static void setsel(struct wl_listener *listener, void *data);
 static void setup(void);
 static void sigchld(int unused);
 static void spawn(const Arg *arg);
+static void *startzmq(void *parg);
 static void startdrag(struct wl_listener *listener, void *data);
 static void tag(const Arg *arg);
 static void tagmon(const Arg *arg);
@@ -355,7 +365,6 @@ static struct wl_listener request_set_sel = {.notify = setsel};
 static struct wl_listener request_start_drag = {.notify = requeststartdrag};
 static struct wl_listener start_drag = {.notify = startdrag};
 static struct wl_listener drag_icon_destroy = {.notify = dragicondestroy};
-
 #ifdef XWAYLAND
 static void activatex11(struct wl_listener *listener, void *data);
 static void configurex11(struct wl_listener *listener, void *data);
@@ -378,6 +387,9 @@ static Atom netatom[NetLast];
 /* compile-time check if all tags fit into an unsigned int bit array. */
 struct NumTags { char limitexceeded[LENGTH(tags) > 31 ? -1 : 1]; };
 
+static pid_t *autostart_pids;
+static size_t autostart_len;
+
 /* function implementations */
 void
 applybounds(Client *c, struct wlr_box *bbox)
@@ -394,6 +406,29 @@ applybounds(Client *c, struct wlr_box *bbox)
 		c->geom.x = bbox->x;
 	if (c->geom.y + c->geom.height + 2 * c->bw <= bbox->y)
 		c->geom.y = bbox->y;
+}
+
+void
+autostartexec(void) {
+	const char *const *p;
+	size_t i = 0;
+
+	/* count entries */
+	for (p = autostart; *p; autostart_len++, p++)
+		while (*++p);
+
+	autostart_pids = calloc(autostart_len, sizeof(pid_t));
+	for (p = autostart; *p; i++, p++) {
+		if ((autostart_pids[i] = fork()) == 0) {
+			setsid();
+			execvp(*p, (char *const *)p);
+			fprintf(stderr, "dwl: execvp %s\n", *p);
+			perror(" failed");
+			_exit(EXIT_FAILURE);
+		}
+		/* skip arguments */
+		while (*++p);
+	}
 }
 
 void
@@ -1006,7 +1041,7 @@ createpointer(struct wlr_input_device *device)
 		if (libinput_device_config_scroll_get_methods(libinput_device) != LIBINPUT_CONFIG_SCROLL_NO_SCROLL)
 			libinput_device_config_scroll_set_method (libinput_device, scroll_method);
 		
-		 if (libinput_device_config_click_get_methods(libinput_device) != LIBINPUT_CONFIG_CLICK_METHOD_NONE)
+		if (libinput_device_config_click_get_methods(libinput_device) != LIBINPUT_CONFIG_CLICK_METHOD_NONE)
                         libinput_device_config_click_set_method (libinput_device, click_method);
 
 		if (libinput_device_config_send_events_get_modes(libinput_device))
@@ -1236,6 +1271,35 @@ fullscreennotify(struct wl_listener *listener, void *data)
 		return;
 	}
 	setfullscreen(c, fullscreen);
+}
+
+void handlertag(zmsg_t *p_msg) {
+    zframe_t *tagframe = zmsg_next(p_msg);
+    if (tagframe) {
+	char tag = *((char*)zframe_data(tagframe));
+	Arg arg = { .ui = 1 << tag};
+	view(&arg);
+    }
+}
+
+MsgHandler handlers[] = {
+    {0, handlertag},
+};
+
+int
+handleincoming(zloop_t *loop, zsock_t *reader, void *arg) {
+    zmsg_t *msg = zmsg_recv(reader);
+    if (msg) {
+	zmsg_next(msg); // header
+	zmsg_next(msg); // padding
+	zframe_t *data_frame = zmsg_next(msg);
+	short id = *((short*)zframe_data(data_frame));
+	handlers[id].func(msg);
+	zframe_reset(zmsg_last(msg), "y", 1);
+	zmsg_send(&msg, reader);
+    }
+    zmsg_destroy(&msg);
+    return 0;
 }
 
 void
@@ -1662,6 +1726,16 @@ printstatus(void)
 void
 quit(const Arg *arg)
 {
+    	size_t i;
+
+	/* kill child processes */
+	for (i = 0; i < autostart_len; i++) {
+		if (0 < autostart_pids[i]) {
+			kill(autostart_pids[i], SIGTERM);
+			waitpid(autostart_pids[i], NULL, 0);
+		}
+	}
+
 	wl_display_terminate(dpy);
 }
 
@@ -1754,6 +1828,7 @@ run(char *startup_cmd)
 	setenv("WAYLAND_DISPLAY", socket, 1);
 
 	/* Now that the socket exists, run the startup command */
+	autostartexec();
 	if (startup_cmd) {
 		int piperw[2];
 		if (pipe(piperw) < 0)
@@ -2110,9 +2185,24 @@ sigchld(int unused)
 	pid_t pid;
 	if (signal(SIGCHLD, sigchld) == SIG_ERR)
 		die("can't install SIGCHLD handler:");
-	while (0 < (pid = waitpid(-1, NULL, WNOHANG)))
+	while (0 < (pid = waitpid(-1, NULL, WNOHANG))) {
 		if (pid == child_pid)
 			child_pid = -1;
+
+		pid_t *p, *lim;
+
+		if (!(p = autostart_pids))
+			continue;
+
+		lim = &p[autostart_len];
+
+		for (; p < lim; p++) {
+			if (*p == pid) {
+				*p = -1;
+				break;
+			}
+		}
+	}
 }
 
 void
@@ -2137,6 +2227,20 @@ startdrag(struct wl_listener *listener, void *data)
 	drag->icon->data = wlr_scene_subsurface_tree_create(layers[LyrNoFocus], drag->icon->surface);
 	motionnotify(0);
 	wl_signal_add(&drag->icon->events.destroy, &drag_icon_destroy);
+}
+
+void
+*startzmq(void *parg) {
+    zsock_t *router = zsock_new_router("ipc:///tmp/dwl.ipc");
+    assert(router);
+
+    zloop_t *reactor = zloop_new();
+    zloop_reader(reactor, router, handleincoming, NULL);
+    zloop_start(reactor);
+
+    zloop_destroy(&reactor);
+    zsock_destroy(&router);
+    return NULL;
 }
 
 void
@@ -2229,14 +2333,16 @@ toggletag(const Arg *arg)
 void
 toggleview(const Arg *arg)
 {
-	unsigned int newtagset = selmon->tagset[selmon->seltags] ^ (arg->ui & TAGMASK);
-
-	if (newtagset) {
-		selmon->tagset[selmon->seltags] = newtagset;
-		focusclient(focustop(selmon), 1);
-		arrange(selmon);
-	}
-	printstatus();
+	Monitor *m;
+	wl_list_for_each(m, &mons, link) {
+	    unsigned int newtagset = m->tagset[m->seltags] ^ (arg->ui & TAGMASK);
+	    if (newtagset) {
+		m->tagset[m->seltags] = newtagset;
+		focusclient(focustop(m), 1);
+		arrange(m);
+	    }
+	    printstatus();
+	};
 }
 
 void
@@ -2556,10 +2662,14 @@ main(int argc, char *argv[])
 	if (!getenv("XDG_RUNTIME_DIR"))
 		die("XDG_RUNTIME_DIR must be set");
 	setup();
+	pthread_t thread_id;
+	pthread_create(&thread_id, NULL, startzmq, NULL);
 	run(startup_cmd);
+	pthread_join(thread_id, NULL);	
 	cleanup();
 	return EXIT_SUCCESS;
 
 usage:
 	die("Usage: %s [-v] [-s startup command]", argv[0]);
 }
+
