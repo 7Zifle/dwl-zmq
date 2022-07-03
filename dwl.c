@@ -2229,8 +2229,14 @@ startdrag(struct wl_listener *listener, void *data)
 	wl_signal_add(&drag->icon->events.destroy, &drag_icon_destroy);
 }
 
+// 0 is good, -1 is shutdown
+int threadstate = 0;
+
 void
 *startzmq(void *parg) {
+    int prevType;
+    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, &prevType);
+    
     zsock_t *router = zsock_new_router("ipc:///tmp/dwl.ipc");
     assert(router);
 
@@ -2665,7 +2671,7 @@ main(int argc, char *argv[])
 	pthread_t thread_id;
 	pthread_create(&thread_id, NULL, startzmq, NULL);
 	run(startup_cmd);
-	pthread_join(thread_id, NULL);	
+	pthread_cancel(thread_id);
 	cleanup();
 	return EXIT_SUCCESS;
 
